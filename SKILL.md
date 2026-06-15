@@ -1,6 +1,6 @@
 ---
 name: pane
-description: This skill should be used when the user asks to branch the current conversation into a fresh agent session in a new Warp pane — e.g. "/pane work on 1 and 2", "let's do (1) and (3), new panes", "start that as a new pane", "spawn a pane to draft X", or "branch this into a new pane". It composes a handoff prompt per task and launches Claude or Codex in each new Warp split pane. Sibling `tab` and `window` skills do the same with new Warp tabs or windows.
+description: This skill should be used when the user asks to branch the current conversation into a fresh agent session in a new Warp pane — e.g. "/pane work on 1 and 2", "let's do (1) and (3), new panes", "start that as a new pane", "spawn a pane to draft X", or "branch this into a new pane". It composes a handoff prompt per task and launches Claude or Codex in each new Warp split pane. The sibling `tab` and `window` skills are identical but open new Warp tabs or windows.
 ---
 
 # Spawn agent sessions in new Warp panes
@@ -15,16 +15,13 @@ The mechanism is bundled: `scripts/spawn_agent_panes.py` drives Warp via AppleSc
 The skill's job is to translate the request into a good handoff prompt per task,
 then call that script.
 
-Requires Warp (macOS) with Accessibility permission granted, plus the `claude`
-and/or `codex` CLI on `PATH`.
-
 ## Workflow
 
 1. **Resolve the tasks.** If the request references list numbers ("1 and 2", "do 3"),
-   map them to the most recent enumerated list in the conversation (e.g. a briefing's
-   numbered options). Otherwise treat the free-text request as the task(s). If numbers
-   are referenced but no enumerated list exists, ask which tasks rather than guessing.
-   One pane is spawned per task.
+   map them to the most recent enumerated list in the conversation (e.g. the
+   briefing's numbered options). Otherwise treat the free-text request as the task(s).
+   If numbers are referenced but no enumerated list exists in the conversation, ask
+   which tasks rather than guessing. One pane is spawned per task.
 
 2. **Read the modifiers** from the request:
    - **Agent**: default to the agent currently running this skill — Claude Code →
@@ -42,10 +39,10 @@ and/or `codex` CLI on `PATH`.
      from the main session.
    - **Mode**: this skill uses `--mode pane`. (The `tab` skill sets `--mode tab`; the
      `window` skill sets `--mode window`.)
-   - **Directory**: default to the current working directory — it is usually correct,
-     and assuming it keeps the common case instant. Set `dir` only when the user
-     explicitly names a project or path. (To make this smarter, add your own rule —
-     e.g. resolve project names against a personal project→path map.)
+   - **Directory**: default to the current working directory — do not infer or look
+     anything up (this keeps the common case instant). Two exceptions: if the user
+     explicitly names a project/path, use that; and if cwd is `plans-and-reviews`,
+     infer the target project (see "Inferring the directory" below).
    - **Model** (claude only): default `opus`; override if asked (e.g. `sonnet`).
 
 3. **Compose the prompt per task** — this is the part only the running agent can do
@@ -55,20 +52,36 @@ and/or `codex` CLI on `PATH`.
    - **Branch mode**: write a *terse directive* ("Now focus on: …"). The fork already
      carries the full history — do not restate context it already has.
 
-4. **Write the manifest** to a temp JSON file and run the bundled script, resolving
-   its path relative to this skill's own directory (`$SKILL_DIR` = the folder
-   containing this SKILL.md):
+4. **Write the manifest** to a temp JSON file and run the script:
    ```bash
-   python3 "$SKILL_DIR/scripts/spawn_agent_panes.py" --mode pane /tmp/pane-manifest.json
+   python3 ~/.agents/skills/pane/scripts/spawn_agent_panes.py --mode pane /tmp/pane-manifest.json
    ```
    (The script also accepts the manifest on stdin via `-`.)
 
 5. **Fire immediately** — do not ask for confirmation. After spawning, print a terse
    one-line summary per pane, **always including the resolved directory** so a wrong
    guess is caught at a glance, e.g.
-   `Spawned 2 panes — [1] claude: refactor the auth module (~/code/myapp) · [2] claude (branch): write the migration (cwd)`.
+   `Spawned 2 panes — [1] claude: Forethought decision doc (~/Documents/Projects/forethought-ai-uplift) · [2] claude (branch): crux questions for Max (cwd)`.
    Exception: if the user says "show me first", "dry run", or similar, print the
    composed prompt(s) and the resolved agent/dir/mode and wait, instead of spawning.
+
+## Inferring the directory
+
+The default is the current working directory, with no lookup — keep it that way in
+almost every context. Inference happens in only two cases:
+
+1. **The user explicitly names a project or path.** Use it. If it is a project name
+   ("the T3A repo", "AI Wow"), resolve it via `~/.agents/references/project-map.md`,
+   picking by task type when a project has several paths (an AI Wow *blog post* → the
+   website dir `~/Documents/www/AI Wow/wow.pjh.is`, not the strategy dir).
+2. **cwd is `plans-and-reviews`.** Planning there is usually *about* a project whose
+   work lives elsewhere, so invert the default: infer the target project from the task
+   via the project map and set `dir` to its repo. Best-guess and show — do not block
+   to ask; the directory is shown in the summary, so a wrong guess is easy to spot and
+   re-run. Only this context triggers inference.
+
+If a named project is absent from the map, fall back to cwd — never invent a path.
+`dir` must always be an absolute, existing directory.
 
 ## Manifest format
 
@@ -76,10 +89,10 @@ A JSON array, one object per task:
 
 ```json
 [
-  {"agent": "claude", "model": "opus", "dir": "/Users/you/code/myapp", "branch": false,
+  {"agent": "claude", "model": "opus", "dir": "/Users/ph/Documents/Projects/infra", "branch": false,
    "prompt": "<full standalone handoff prompt>"},
   {"agent": "claude", "branch": true,
-   "prompt": "Now focus on: write integration tests for the payments module."}
+   "prompt": "Now focus on: draft my crux questions for Max for Monday."}
 ]
 ```
 
@@ -106,7 +119,7 @@ Keep it focused — enough to act, not a transcript dump.
   a permission hint and exits non-zero — relay that to the user.
 - The manifest temp file is not auto-deleted; write it with `mktemp` and it is harmless
   litter in `/tmp`. (The promptfile and runner self-delete once the pane launches.)
-- Panes get cramped beyond ~3 in one window; for many tasks, use the `tab` or `window`
-  variant instead.
-- `dir` must be an absolute path. Never invoke an interactive directory picker — it
-  hangs in a non-interactive agent context.
+- Panes get cramped beyond ~3 in one window; for many tasks, suggest the `tab` or
+  `window` skill.
+- `dir` must be an absolute path. Never invoke the interactive project picker
+  (`coding_agent_launcher.py`) — it hangs in a non-interactive agent context.

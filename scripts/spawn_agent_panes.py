@@ -116,8 +116,10 @@ def write_runner(task: dict) -> str:
 def build_applescript(mode: str) -> str:
     """AppleScript that loops over runner paths (passed as argv) and drives Warp.
 
-    Delays are copied from the working `c2` helper; tune the post-split delay if the
-    first characters get dropped on a slow shell start.
+    The split/open delays are copied from the working `c2` helper. Submit the
+    runner path as text plus a return in a single keystroke event; in practice this
+    is less flaky than sending Return as a separate key-code event from a Python
+    osascript subprocess.
     """
     if mode == "pane":
         open_keys = 'keystroke "d" using command down'  # Cmd+D: split right
@@ -138,9 +140,7 @@ def build_applescript(mode: str) -> str:
         tell application "System Events"
             {open_keys}
             delay 1.0
-            keystroke (runnerPath as string)
-            delay 0.1
-            key code 36
+            keystroke ((runnerPath as string) & return)
             {refocus}
         end tell
     end repeat
