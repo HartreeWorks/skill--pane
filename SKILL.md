@@ -10,10 +10,10 @@ own new Warp pane. Useful when a session (e.g. a morning briefing) ends with a m
 of next actions and the user wants to peel some off into parallel work without
 losing the current thread.
 
-The mechanism is bundled: `scripts/spawn_agent_panes.py` drives Warp via AppleScript
-(split pane, type a self-cleaning runner path, press Enter, refocus the origin pane).
-The skill's job is to translate the request into a good handoff prompt per task,
-then call that script.
+The mechanism is two-phase. `scripts/spawn_agent_panes.py reserve` immediately opens
+the requested Warp destinations, starts a short waiter in each, and returns focus to
+the origin. The agent then composes the handoffs without touching Warp. `fulfil`
+atomically publishes each completed launch payload; the waiter claims and executes it.
 
 ## Workflow
 
@@ -45,25 +45,44 @@ then call that script.
      infer the target project (see "Inferring the directory" below).
    - **Model** (claude only): default `opus`; override if asked (e.g. `sonnet`).
 
-3. **Compose the prompt per task** — this is the part only the running agent can do
+3. **Handle previews before reserving.** If the user says "show me first", "dry run",
+   or similar, compose and show the proposed prompts and resolved settings, then wait.
+   Do not create empty Warp destinations for a preview.
+
+4. **Reserve immediately.** Once the task count, mode, and any directory confidence
+   question are resolved, reserve before composing the full handoffs:
+   ```bash
+   python3 ~/.claude/skills/pane/scripts/spawn_agent_panes.py reserve --mode pane --count 2
+   ```
+   Record the reservation directory from the JSON printed on stdout. This command
+   foregrounds Warp briefly, opens one destination per task, types a short waiter,
+   returns focus after each opening, and succeeds only after every waiter reports
+   `waiting`. Do not continue to handoff composition if reservation fails.
+
+5. **Compose the prompt per task** — this is the part only the running agent can do
    well, because it has the conversation context the new session lacks:
    - **Fresh mode** (default): write a strong *standalone* handoff. The new agent
      starts with zero context, so include everything it needs (see checklist below).
    - **Branch mode**: write a *terse directive* ("Now focus on: …"). The fork already
      carries the full history — do not restate context it already has.
 
-4. **Write the manifest** to a temp JSON file and run the script:
+6. **Write the manifest and fulfil the reservation**:
    ```bash
-   python3 ~/.agents/skills/pane/scripts/spawn_agent_panes.py --mode pane /tmp/pane-manifest.json
+   python3 ~/.claude/skills/pane/scripts/spawn_agent_panes.py fulfil /tmp/pane-reservation.ABC123 /tmp/pane-manifest.json
    ```
-   (The script also accepts the manifest on stdin via `-`.)
+   The second path may be `-` to read the manifest from stdin. `fulfil` does not
+   activate Warp or send keystrokes. It validates every task first, writes each
+   payloads, then publishes them to the waiting sessions.
 
-5. **Fire immediately** — do not ask for confirmation. After spawning, print a terse
-   one-line summary per pane, **always including the resolved directory** so a wrong
-   guess is caught at a glance, e.g.
-   `Spawned 2 panes — [1] claude: Forethought decision doc (~/Documents/Projects/forethought-ai-uplift) · [2] claude (branch): crux questions for Max (cwd)`.
-   Exception: if the user says "show me first", "dry run", or similar, print the
-   composed prompt(s) and the resolved agent/dir/mode and wait, instead of spawning.
+7. **Report the launches.** Print a terse one-line summary per pane, **always including the
+   resolved directory** so a wrong guess is caught at a glance, e.g.
+   `Spawned 2 panes — [1] claude: Client strategy doc (~/Documents/Projects/client-strategy) · [2] claude (branch): crux questions for Alex (cwd)`.
+
+If work cannot reach `fulfil` after a successful reservation, release the waiters:
+```bash
+python3 ~/.claude/skills/pane/scripts/spawn_agent_panes.py cancel /tmp/pane-reservation.ABC123
+```
+Do not cancel after fulfilment begins. Waiters otherwise time out after 10 minutes.
 
 ## Inferring the directory
 
@@ -71,14 +90,23 @@ The default is the current working directory, with no lookup — keep it that wa
 almost every context. Inference happens in only two cases:
 
 1. **The user explicitly names a project or path.** Use it. If it is a project name
-   ("the T3A repo", "AI Wow"), resolve it via `~/.agents/references/project-map.md`,
+   ("the T3A repo", "AI Wow"), resolve it via `~/.claude/references/project-map.md`,
    picking by task type when a project has several paths (an AI Wow *blog post* → the
    website dir `~/Documents/www/AI Wow/wow.pjh.is`, not the strategy dir).
 2. **cwd is `plans-and-reviews`.** Planning there is usually *about* a project whose
    work lives elsewhere, so invert the default: infer the target project from the task
-   via the project map and set `dir` to its repo. Best-guess and show — do not block
-   to ask; the directory is shown in the summary, so a wrong guess is easy to spot and
-   re-run. Only this context triggers inference.
+   via the project map and set `dir` to its repo. Only this context triggers inference.
+
+**Confidence gate — flag before handoff if unsure.** Whenever you resolve a `dir` by
+inference (not an explicit user-named path), judge how confident you are:
+- **Confident** (the task clearly maps to one project): best-guess and show — proceed
+  without asking. The resolved directory appears in the summary, so a wrong guess is
+  easy to spot and re-run.
+- **Unsure** (the task maps to no clear project, or is ambiguous between several):
+  **stop and ask which project/directory before spawning.** Do not silently guess a
+  directory you are not confident about — a handoff into the wrong repo wastes a whole
+  fresh session. Name your best candidate(s) in the question so the user can confirm with
+  one word.
 
 If a named project is absent from the map, fall back to cwd — never invent a path.
 `dir` must always be an absolute, existing directory.
@@ -89,10 +117,10 @@ A JSON array, one object per task:
 
 ```json
 [
-  {"agent": "claude", "model": "opus", "dir": "/Users/ph/Documents/Projects/infra", "branch": false,
+  {"agent": "claude", "model": "opus", "dir": "~/Documents/Projects/infra", "branch": false,
    "prompt": "<full standalone handoff prompt>"},
   {"agent": "claude", "branch": true,
-   "prompt": "Now focus on: draft my crux questions for Max for Monday."}
+   "prompt": "Now focus on: draft my crux questions for Alex for Monday."}
 ]
 ```
 
@@ -114,11 +142,18 @@ Keep it focused — enough to act, not a transcript dump.
 
 ## Notes
 
+- Reservation activates Warp, verifies it is frontmost, opens every destination from
+  the currently active origin, and immediately returns focus after each opening.
+- Reserve before lengthy prompt composition. This narrows the remaining targeting
+  race to the short interval between the user's request and the reserve command; later
+  tab, window, or app changes cannot affect already-opened destinations.
+- Reservation verifies that all waiters started. A display-sleep or input-suppression
+  failure therefore returns non-zero instead of reporting an unverified spawn.
 - Spawning uses Warp keystroke automation and needs Accessibility permission for Warp
   (System Settings > Privacy & Security > Accessibility). On failure the script prints
   a permission hint and exits non-zero — relay that to the user.
-- The manifest temp file is not auto-deleted; write it with `mktemp` and it is harmless
-  litter in `/tmp`. (The promptfile and runner self-delete once the pane launches.)
+- Reservation and manifest files live in `/tmp`. Payload and prompt files self-clean
+  when their agent exits; small state files may remain until macOS clears `/tmp`.
 - Panes get cramped beyond ~3 in one window; for many tasks, suggest the `tab` or
   `window` skill.
 - `dir` must be an absolute path. Never invoke the interactive project picker

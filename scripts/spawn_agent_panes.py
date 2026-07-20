@@ -1,35 +1,15 @@
 #!/usr/bin/env python3
-"""Spawn one or more fresh AI-agent sessions in new Warp panes, tabs, or windows.
+"""Reserve Warp destinations now, then launch agents when prompts are ready.
 
-Generalises the `c2` zsh helper (~/.zshrc): for each task it stashes the prompt in
-a /tmp file, writes a self-cleaning runner script, then drives Warp via a single
-AppleScript pass — splitting a pane (Cmd+D) or opening a window (Cmd+N), typing the
-runner path, pressing Enter, and (pane mode) refocusing the origin pane.
+Used by the pane, tab, and window skills:
 
-Used by the `pane` and `window` skills. Reads a JSON manifest of tasks; the calling
-agent composes the prompts.
+    spawn_agent_panes.py reserve --mode pane|tab|window --count N
+    spawn_agent_panes.py fulfil <reservation-directory> <manifest.json|->
+    spawn_agent_panes.py cancel <reservation-directory>
 
-Usage:
-    spawn_agent_panes.py --mode pane|tab|window <manifest.json>
-    spawn_agent_panes.py --mode pane -        # read manifest from stdin
+The previous one-shot interface remains available:
 
-Manifest: a JSON array of task objects, each:
-    {
-      "agent":  "claude" | "codex",   # default: $CLAUDECODE -> claude, else codex
-      "model":  "opus",               # claude only; default opus. Ignored for codex.
-      "dir":    "/abs/path",          # default: current working directory
-      "branch": false,                # fork the current session instead of fresh
-      "prompt": "..."                 # required; the seed prompt / task directive
-    }
-
-Launch line per (agent x branch):
-    claude, fresh  : claude --model <model> "$(cat promptfile)"
-    claude, branch : claude --resume <CLAUDE_CODE_SESSION_ID> --fork-session --model <model> "$(cat promptfile)"
-    codex,  fresh  : codex "$(cat promptfile)"
-    codex,  branch : codex fork --last "$(cat promptfile)"
-
-Requires Accessibility permission for Warp (System Settings > Privacy & Security >
-Accessibility) — the same permission `c2` relies on.
+    spawn_agent_panes.py --mode pane|tab|window <manifest.json|->
 """
 
 from __future__ import annotations
@@ -41,20 +21,24 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
+from pathlib import Path
+
 
 ACCESSIBILITY_HINT = (
     "spawn_agent_panes: couldn't drive Warp - grant Accessibility to Warp in "
     "System Settings > Privacy & Security > Accessibility, then retry."
 )
+DEFAULT_TIMEOUT_SECONDS = 600
+START_TIMEOUT_SECONDS = 5.0
+MODES = ("pane", "tab", "window")
 
 
 def default_agent() -> str:
-    """Default agent type from the environment of the calling agent."""
     return "claude" if os.environ.get("CLAUDECODE") == "1" else "codex"
 
 
 def build_launch_line(agent: str, model: str, branch: bool, promptfile: str) -> str:
-    """The command the new pane's shell runs to start the agent."""
     pf = shlex.quote(promptfile)
     if agent == "claude":
         model_arg = f"--model {shlex.quote(model)}"
@@ -71,111 +55,158 @@ def build_launch_line(agent: str, model: str, branch: bool, promptfile: str) -> 
                 file=sys.stderr,
             )
         return f'claude {model_arg} "$(cat {pf})"'
-    # codex
     if branch:
         return f'codex fork --last "$(cat {pf})"'
     return f'codex "$(cat {pf})"'
 
 
-def write_runner(task: dict) -> str:
-    """Write the prompt + self-cleaning runner script; return the runner path."""
-    agent = (task.get("agent") or default_agent()).lower()
-    if agent not in ("claude", "codex"):
-        raise ValueError(f"unknown agent {agent!r} (expected 'claude' or 'codex')")
-    model = task.get("model") or "opus"
-    directory = task.get("dir") or os.getcwd()
-    branch = bool(task.get("branch"))
-    prompt = task.get("prompt")
-    if not prompt or not prompt.strip():
-        raise ValueError("task is missing a non-empty 'prompt'")
+def _path(root: str | Path, kind: str, index: int | None = None) -> Path:
+    name = kind if index is None else f"{kind}.{index}"
+    return Path(root) / name
 
-    # Use /tmp explicitly (like the c2 helper): the runner path is typed into the
-    # new pane keystroke-by-keystroke, so a short path drops far fewer characters
-    # than the long $TMPDIR default (/var/folders/...).
-    pf_fd, promptfile = tempfile.mkstemp(prefix="pane-prompt.", dir="/tmp")
-    with os.fdopen(pf_fd, "w") as fh:
-        fh.write(prompt)
 
-    launch = build_launch_line(agent, model, branch, promptfile)
-    runner_fd, runner = tempfile.mkstemp(prefix="pane-runner.", dir="/tmp")
-    runner_body = (
-        "#!/bin/zsh\n"
-        f"cd {shlex.quote(directory)}\n"
-        f"{launch}\n"
-        f"rm -f {shlex.quote(promptfile)} {shlex.quote(runner)}\n"
+def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(content)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    except BaseException:
+        _safe_unlink(temporary)
+        raise
+
+
+def _state_writer(state: Path) -> str:
+    quoted = shlex.quote(str(state))
+    return (
+        "write_state() {\n"
+        f"    local state_path={quoted}\n"
+        '    local state_tmp="${state_path}.tmp.$$"\n'
+        '    print -r -- "$1" > "$state_tmp"\n'
+        '    mv -f "$state_tmp" "$state_path"\n'
+        "}\n"
     )
-    with os.fdopen(runner_fd, "w") as fh:
-        fh.write(runner_body)
-    os.chmod(runner, 0o755)
 
-    label = f"{agent}{' (branch)' if branch else ''}"
-    print(f"spawn_agent_panes: prepared {label} in {directory}", file=sys.stderr)
-    return runner
+
+def write_waiter(root: str | Path, index: int, timeout_seconds: int) -> Path:
+    waiter = _path(root, "waiter", index)
+    ready = shlex.quote(str(_path(root, "ready", index)))
+    claimed = shlex.quote(str(_path(root, "claimed", index)))
+    cancel = shlex.quote(str(_path(root, "cancel")))
+    body = (
+        "#!/bin/zsh\n"
+        f"{_state_writer(_path(root, 'state', index))}"
+        "write_state waiting\n"
+        'print -r -- "Preparing agent handoff..."\n'
+        f"deadline=$((SECONDS + {timeout_seconds}))\n"
+        "while (( SECONDS < deadline )); do\n"
+        f"    if [[ -e {cancel} ]]; then\n"
+        "        write_state cancelled\n"
+        '        print -r -- "Agent handoff cancelled."\n'
+        "        exit 2\n"
+        "    fi\n"
+        f"    if [[ -e {ready} ]] && mv -f {ready} {claimed}; then\n"
+        "        write_state claimed\n"
+        f"        exec {claimed}\n"
+        "    fi\n"
+        "    sleep 0.2\n"
+        "done\n"
+        "write_state timed_out\n"
+        'print -r -- "Agent handoff timed out."\n'
+        "exit 1\n"
+    )
+    _atomic_write(waiter, body, mode=0o700)
+    return waiter
+
+
+def create_reservation(mode: str, count: int, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> dict:
+    if mode not in MODES:
+        raise ValueError(f"unknown mode {mode!r}")
+    if count < 1:
+        raise ValueError("count must be at least 1")
+    if timeout_seconds < 1:
+        raise ValueError("timeout must be at least 1 second")
+
+    root = tempfile.mkdtemp(prefix="pane-reservation.", dir="/tmp")
+    reservation = {
+        "version": 1,
+        "path": root,
+        "mode": mode,
+        "count": count,
+        "timeout_seconds": timeout_seconds,
+    }
+    try:
+        for index in range(count):
+            write_waiter(root, index, timeout_seconds)
+        _atomic_write(_path(root, "reservation.json"), json.dumps(reservation) + "\n")
+        return reservation
+    except BaseException:
+        cleanup_reservation(root)
+        raise
+
+
+def read_reservation(root: str | Path) -> dict:
+    reservation = json.loads(_path(root, "reservation.json").read_text())
+    if (
+        reservation.get("version") != 1
+        or reservation.get("mode") not in MODES
+        or not isinstance(reservation.get("count"), int)
+        or reservation["count"] < 1
+    ):
+        raise ValueError("invalid reservation")
+    reservation["path"] = str(root)
+    return reservation
 
 
 def build_applescript(mode: str) -> str:
-    """AppleScript that loops over runner paths (passed as argv) and drives Warp.
-
-    The split/open delays are copied from the working `c2` helper. Submit the
-    runner path as text plus a return in a single keystroke event; in practice this
-    is less flaky than sending Return as a separate key-code event from a Python
-    osascript subprocess.
-    """
     if mode == "pane":
-        open_keys = 'keystroke "d" using command down'  # Cmd+D: split right
-        # Ctrl+[ = pane_group:navigate_prev -> back to the origin pane so the next
-        # split originates from the same pane.
-        refocus = "delay 0.2\n            key code 33 using control down"
+        open_action = 'keystroke "d" using command down'
+        return_action = "key code 33 using control down"
     elif mode == "tab":
-        open_keys = 'keystroke "t" using command down'  # Cmd+T: new tab
-        refocus = ""
-    else:  # window
-        open_keys = 'keystroke "n" using command down'  # Cmd+N: new window
-        refocus = ""
+        open_action = 'keystroke "t" using command down'
+        return_action = 'keystroke "[" using {command down, shift down}'
+    elif mode == "window":
+        open_action = 'keystroke "n" using command down'
+        return_action = "key code 50 using command down"
+    else:
+        raise ValueError(f"unknown mode {mode!r}")
 
-    return f"""on run argv
+    return f'''on run argv
     tell application "Warp" to activate
-    delay 0.3
-    repeat with runnerPath in argv
-        tell application "System Events"
-            {open_keys}
+    tell application "System Events"
+        repeat 50 times
+            if exists process "Warp" then
+                set frontmost of process "Warp" to true
+                if frontmost of process "Warp" then exit repeat
+            end if
+            delay 0.1
+        end repeat
+        if not frontmost of process "Warp" then error "Warp did not become frontmost."
+        repeat with waiterPath in argv
+            {open_action}
             delay 1.0
-            keystroke ((runnerPath as string) & return)
-            {refocus}
-        end tell
-    end repeat
-end run"""
+            keystroke ((waiterPath as string) & return)
+            delay 0.3
+            {return_action}
+            delay 0.3
+        end repeat
+    end tell
+end run'''
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Spawn agent sessions in Warp panes/tabs/windows.")
-    parser.add_argument("--mode", choices=("pane", "tab", "window"), required=True)
-    parser.add_argument("manifest", help="Path to manifest JSON, or '-' for stdin.")
-    args = parser.parse_args()
-
-    raw = sys.stdin.read() if args.manifest == "-" else open(args.manifest).read()
+def read_state(root: str | Path, index: int) -> str:
     try:
-        tasks = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"spawn_agent_panes: invalid manifest JSON: {exc}", file=sys.stderr)
-        return 2
-    if not isinstance(tasks, list) or not tasks:
-        print("spawn_agent_panes: manifest must be a non-empty JSON array.", file=sys.stderr)
-        return 2
+        return _path(root, "state", index).read_text().strip()
+    except OSError:
+        return ""
 
-    runners: list[str] = []
-    try:
-        for task in tasks:
-            runners.append(write_runner(task))
-    except (ValueError, KeyError) as exc:
-        for runner in runners:
-            _cleanup_runner(runner)
-        print(f"spawn_agent_panes: {exc}", file=sys.stderr)
-        return 2
 
-    script = build_applescript(args.mode)
+def open_reserved_sessions(reservation: dict) -> bool:
+    root = reservation["path"]
+    waiters = [str(_path(root, "waiter", i)) for i in range(reservation["count"])]
     result = subprocess.run(
-        ["osascript", "-e", script, *runners],
+        ["osascript", "-e", build_applescript(reservation["mode"]), *waiters],
         capture_output=True,
         text=True,
     )
@@ -183,36 +214,207 @@ def main() -> int:
         print(ACCESSIBILITY_HINT, file=sys.stderr)
         if result.stderr.strip():
             print(result.stderr.strip(), file=sys.stderr)
-        for runner in runners:
-            _cleanup_runner(runner)
-        return 1
+        return False
 
-    print(
-        f"spawn_agent_panes: spawned {len(runners)} {args.mode}"
-        f"{'' if len(runners) == 1 else 's'}.",
-        file=sys.stderr,
-    )
+    pending = set(range(reservation["count"]))
+    deadline = time.monotonic() + START_TIMEOUT_SECONDS
+    while pending and time.monotonic() < deadline:
+        pending = {index for index in pending if read_state(root, index) != "waiting"}
+        if pending:
+            time.sleep(0.05)
+    return not pending
+
+
+def _load_tasks(manifest: str) -> list[dict]:
+    raw = sys.stdin.read() if manifest == "-" else Path(manifest).read_text()
+    tasks = json.loads(raw)
+    if not isinstance(tasks, list) or not tasks or not all(isinstance(task, dict) for task in tasks):
+        raise ValueError("manifest must be a non-empty JSON array of task objects")
+    return tasks
+
+
+def _normalise_task(task: dict) -> dict:
+    agent = task.get("agent") or default_agent()
+    if not isinstance(agent, str) or agent.lower() not in ("claude", "codex"):
+        raise ValueError("task 'agent' must be 'claude' or 'codex'")
+    prompt = task.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("task is missing a non-empty 'prompt'")
+    directory = task.get("dir") or os.getcwd()
+    if not isinstance(directory, str) or not os.path.isdir(directory):
+        raise ValueError(f"task directory does not exist: {directory}")
+    model = task.get("model") or "opus"
+    if not isinstance(model, str):
+        raise ValueError("task 'model' must be a string")
+    return {
+        "agent": agent.lower(),
+        "model": model,
+        "dir": os.path.abspath(directory),
+        "branch": bool(task.get("branch")),
+        "prompt": prompt,
+    }
+
+
+def _prepare_payload(root: str, index: int, task: dict) -> tuple[Path, Path]:
+    prompt = _path(root, "prompt", index)
+    temporary = _path(root, "payload", index)
+    claimed = _path(root, "claimed", index)
+    waiter = _path(root, "waiter", index)
+    try:
+        _atomic_write(prompt, task["prompt"])
+        launch = build_launch_line(
+            task["agent"], task["model"], task["branch"], str(prompt)
+        )
+        cleanup = " ".join(shlex.quote(str(path)) for path in (prompt, claimed, waiter))
+        body = (
+            "#!/bin/zsh\n"
+            f"{_state_writer(_path(root, 'state', index))}"
+            "finish() {\n"
+            "    local status=$?\n"
+            '    write_state "completed:$status"\n'
+            f"    rm -f {cleanup}\n"
+            "    return $status\n"
+            "}\n"
+            "trap finish EXIT\n"
+            "write_state started\n"
+            f"cd {shlex.quote(task['dir'])} || exit 1\n"
+            f"{launch}\n"
+            "exit $?\n"
+        )
+        _atomic_write(temporary, body, mode=0o700)
+        return temporary, prompt
+    except BaseException:
+        _safe_unlink(temporary)
+        _safe_unlink(prompt)
+        raise
+
+
+def fulfil_reservation(root: str, tasks: list[dict]) -> dict:
+    reservation = read_reservation(root)
+    if len(tasks) != reservation["count"]:
+        raise ValueError(
+            f"reservation has {reservation['count']} sessions but {len(tasks)} tasks"
+        )
+    tasks = [_normalise_task(task) for task in tasks]
+    if _path(root, "cancel").exists():
+        raise ValueError("reservation was cancelled")
+    for index in range(reservation["count"]):
+        if read_state(root, index) != "waiting":
+            raise ValueError(f"reserved session {index + 1} is no longer waiting")
+
+    prepared: list[tuple[Path, Path]] = []
+    try:
+        for index, task in enumerate(tasks):
+            prepared.append(_prepare_payload(root, index, task))
+        for index, (temporary, _) in enumerate(prepared):
+            os.replace(temporary, _path(root, "ready", index))
+    except BaseException:
+        for temporary, prompt in prepared:
+            if temporary.exists():
+                _safe_unlink(temporary)
+                _safe_unlink(prompt)
+        raise
+    return {"reservation": root, "published": len(prepared)}
+
+
+def cancel_reservation(root: str) -> dict:
+    reservation = read_reservation(root)
+    states = [read_state(root, index) for index in range(reservation["count"])]
+    if any(state in ("claimed", "started") or state.startswith("completed:") for state in states):
+        raise ValueError("cannot cancel after fulfilment has started")
+    _atomic_write(_path(root, "cancel"), "cancel\n")
+    return {"reservation": root, "cancelled": states.count("waiting")}
+
+
+def cleanup_reservation(root: str | Path) -> None:
+    path = Path(root)
+    if not path.is_dir():
+        return
+    for child in path.iterdir():
+        if child.is_file() or child.is_symlink():
+            _safe_unlink(child)
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def reserve_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="spawn_agent_panes.py reserve")
+    parser.add_argument("--mode", choices=MODES, required=True)
+    parser.add_argument("--count", type=int, required=True)
+    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    args = parser.parse_args(argv)
+    try:
+        reservation = create_reservation(args.mode, args.count, args.timeout_seconds)
+    except (OSError, ValueError) as exc:
+        print(f"spawn_agent_panes: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps({"reservation": reservation["path"]}))
+    if not open_reserved_sessions(reservation):
+        print("spawn_agent_panes: one or more waiters did not start.", file=sys.stderr)
+        return 1
+    print(f"spawn_agent_panes: reserved {args.count} Warp {args.mode}(s).", file=sys.stderr)
     return 0
 
 
-def _cleanup_runner(runner: str) -> None:
-    """Remove a runner and the promptfile it references (best effort).
-
-    Only reached when a pane never launches (build error / osascript failure); a
-    successfully launched runner deletes itself.
-    """
+def fulfil_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="spawn_agent_panes.py fulfil")
+    parser.add_argument("reservation")
+    parser.add_argument("manifest")
+    args = parser.parse_args(argv)
     try:
-        with open(runner) as fh:
-            body = fh.read()
-        for token in body.split():
-            if "pane-prompt." in token:
-                _safe_unlink(token.strip('"\''))
-    except OSError:
-        pass
-    _safe_unlink(runner)
+        result = fulfil_reservation(args.reservation, _load_tasks(args.manifest))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"spawn_agent_panes: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result))
+    return 0
 
 
-def _safe_unlink(path: str) -> None:
+def cancel_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="spawn_agent_panes.py cancel")
+    parser.add_argument("reservation")
+    args = parser.parse_args(argv)
+    try:
+        result = cancel_reservation(args.reservation)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"spawn_agent_panes: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result))
+    return 0
+
+
+def legacy_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="spawn_agent_panes.py")
+    parser.add_argument("--mode", choices=MODES, required=True)
+    parser.add_argument("manifest")
+    args = parser.parse_args(argv)
+    try:
+        tasks = _load_tasks(args.manifest)
+        reservation = create_reservation(args.mode, len(tasks))
+        print(json.dumps({"reservation": reservation["path"]}))
+        if not open_reserved_sessions(reservation):
+            return 1
+        print(json.dumps(fulfil_reservation(reservation["path"], tasks)))
+        return 0
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"spawn_agent_panes: {exc}", file=sys.stderr)
+        return 2
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "reserve":
+        return reserve_main(arguments[1:])
+    if arguments and arguments[0] == "fulfil":
+        return fulfil_main(arguments[1:])
+    if arguments and arguments[0] == "cancel":
+        return cancel_main(arguments[1:])
+    return legacy_main(arguments)
+
+
+def _safe_unlink(path: str | Path) -> None:
     try:
         os.unlink(path)
     except OSError:
