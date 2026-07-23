@@ -31,7 +31,83 @@ class SpawnAgentPanesTests(unittest.TestCase):
         for mode, (open_action, return_action) in expected.items():
             script = spawn.build_applescript(mode)
             self.assertLess(script.index(open_action), script.index(return_action))
-            self.assertIn('set frontmost of process "Warp" to true', script)
+            self.assertIn('tell application "Warp" to activate', script)
+            self.assertNotIn('set frontmost of process "Warp" to true', script)
+
+    def test_applescript_guards_focus_and_modifiers_before_typing(self):
+        script = spawn.build_applescript("pane")
+        open_destination = script.index('keystroke "d" using command down')
+        type_waiter = script.index("keystroke ((waiterPath as string) & return)")
+        guard_command = spawn._applescript_string(spawn.modifier_guard_command())
+
+        self.assertEqual(script.count(f"do shell script {guard_command}"), 3)
+        self.assertLess(script.index(f"do shell script {guard_command}"), open_destination)
+        self.assertLess(
+            script.index(f"do shell script {guard_command}", open_destination),
+            type_waiter,
+        )
+        self.assertLess(
+            script.index('if not frontmost of process "Warp"', open_destination),
+            type_waiter,
+        )
+        self.assertIn("Warp lost focus before waiter command entry", script)
+        return_to_origin = script.index("key code 33 using control down")
+        self.assertLess(
+            script.index(f"do shell script {guard_command}", type_waiter),
+            return_to_origin,
+        )
+
+    def test_modifier_gate_requires_a_stable_release_interval(self):
+        flags = iter(
+            [
+                spawn.MODIFIER_FLAGS_MASK,
+                0,
+                0,
+                spawn.MODIFIER_FLAGS_MASK,
+                0,
+                0,
+                0,
+                0,
+            ]
+        )
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        self.assertTrue(
+            spawn.wait_for_modifiers_released(
+                timeout_seconds=1.0,
+                stable_seconds=0.2,
+                poll_interval_seconds=0.1,
+                flags_reader=lambda: next(flags),
+                clock=clock,
+                sleeper=sleep,
+            )
+        )
+
+    def test_modifier_gate_times_out_while_a_modifier_is_held(self):
+        now = [0.0]
+
+        def clock():
+            return now[0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        self.assertFalse(
+            spawn.wait_for_modifiers_released(
+                timeout_seconds=0.3,
+                stable_seconds=0.1,
+                poll_interval_seconds=0.1,
+                flags_reader=lambda: spawn.MODIFIER_FLAGS_MASK,
+                clock=clock,
+                sleeper=sleep,
+            )
+        )
 
     def test_reservation_creates_waiters_and_metadata(self):
         reservation = spawn.create_reservation("pane", 2, timeout_seconds=30)
@@ -52,6 +128,17 @@ class SpawnAgentPanesTests(unittest.TestCase):
             spawn.subprocess, "run", return_value=MagicMock(returncode=0, stderr="")
         ):
             self.assertTrue(spawn.open_reserved_sessions(reservation))
+
+    def test_open_failure_cancels_any_waiters_that_started(self):
+        reservation = spawn.create_reservation("pane", 2, timeout_seconds=30)
+        self.addCleanup(spawn.cleanup_reservation, reservation["path"])
+        with patch.object(
+            spawn.subprocess,
+            "run",
+            return_value=MagicMock(returncode=1, stderr="focus changed"),
+        ):
+            self.assertFalse(spawn.open_reserved_sessions(reservation))
+        self.assertEqual(spawn._path(reservation["path"], "cancel").read_text(), "cancel\n")
 
     def test_fulfil_publishes_executable_payload(self):
         reservation = spawn.create_reservation("pane", 1, timeout_seconds=30)

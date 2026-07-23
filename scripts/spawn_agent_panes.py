@@ -15,6 +15,7 @@ The previous one-shot interface remains available:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import shlex
@@ -26,12 +27,19 @@ from pathlib import Path
 
 
 ACCESSIBILITY_HINT = (
-    "spawn_agent_panes: couldn't drive Warp - grant Accessibility to Warp in "
-    "System Settings > Privacy & Security > Accessibility, then retry."
+    "spawn_agent_panes: stopped before unsafe input. Keep Warp frontmost, release "
+    "Command, Shift, Option, and Control, then retry. If automation is blocked, "
+    "grant Warp Accessibility access in System Settings > Privacy & Security > "
+    "Accessibility."
 )
 DEFAULT_TIMEOUT_SECONDS = 600
 START_TIMEOUT_SECONDS = 5.0
+MODIFIER_RELEASE_TIMEOUT_SECONDS = 5.0
+MODIFIER_RELEASE_STABLE_SECONDS = 0.3
+MODIFIER_POLL_INTERVAL_SECONDS = 0.025
+MODIFIER_FLAGS_MASK = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)
 MODES = ("pane", "tab", "window")
+_modifier_flags_state = None
 
 
 def default_agent() -> str:
@@ -159,6 +167,59 @@ def read_reservation(root: str | Path) -> dict:
     return reservation
 
 
+def current_modifier_flags() -> int:
+    global _modifier_flags_state
+    if _modifier_flags_state is None:
+        application_services = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        _modifier_flags_state = application_services.CGEventSourceFlagsState
+        _modifier_flags_state.argtypes = [ctypes.c_int]
+        _modifier_flags_state.restype = ctypes.c_uint64
+    return int(_modifier_flags_state(0))
+
+
+def wait_for_modifiers_released(
+    timeout_seconds: float = MODIFIER_RELEASE_TIMEOUT_SECONDS,
+    stable_seconds: float = MODIFIER_RELEASE_STABLE_SECONDS,
+    poll_interval_seconds: float = MODIFIER_POLL_INTERVAL_SECONDS,
+    *,
+    flags_reader=current_modifier_flags,
+    clock=time.monotonic,
+    sleeper=time.sleep,
+) -> bool:
+    """Wait until no dangerous modifier has been held for a stable interval."""
+    started_at = clock()
+    released_at: float | None = None
+    while clock() - started_at < timeout_seconds:
+        if flags_reader() & MODIFIER_FLAGS_MASK:
+            released_at = None
+        elif released_at is None:
+            released_at = clock()
+        elif clock() - released_at >= stable_seconds:
+            return True
+        sleeper(poll_interval_seconds)
+    return False
+
+
+def modifier_guard_command() -> str:
+    return shlex.join(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "_wait-for-modifiers",
+            "--timeout-seconds",
+            str(MODIFIER_RELEASE_TIMEOUT_SECONDS),
+            "--stable-seconds",
+            str(MODIFIER_RELEASE_STABLE_SECONDS),
+        ]
+    )
+
+
+def _applescript_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def build_applescript(mode: str) -> str:
     if mode == "pane":
         open_action = 'keystroke "d" using command down'
@@ -172,22 +233,29 @@ def build_applescript(mode: str) -> str:
     else:
         raise ValueError(f"unknown mode {mode!r}")
 
+    modifier_guard = f"do shell script {_applescript_string(modifier_guard_command())}"
+
     return f'''on run argv
     tell application "Warp" to activate
     tell application "System Events"
         repeat 50 times
             if exists process "Warp" then
-                set frontmost of process "Warp" to true
                 if frontmost of process "Warp" then exit repeat
             end if
             delay 0.1
         end repeat
         if not frontmost of process "Warp" then error "Warp did not become frontmost."
         repeat with waiterPath in argv
+            {modifier_guard}
+            if not frontmost of process "Warp" then error "Warp lost focus before opening a destination."
             {open_action}
             delay 1.0
+            {modifier_guard}
+            if not frontmost of process "Warp" then error "Warp lost focus before waiter command entry."
             keystroke ((waiterPath as string) & return)
             delay 0.3
+            {modifier_guard}
+            if not frontmost of process "Warp" then error "Warp lost focus before returning to the origin."
             {return_action}
             delay 0.3
         end repeat
@@ -211,6 +279,7 @@ def open_reserved_sessions(reservation: dict) -> bool:
         text=True,
     )
     if result.returncode != 0:
+        _atomic_write(_path(root, "cancel"), "cancel\n")
         print(ACCESSIBILITY_HINT, file=sys.stderr)
         if result.stderr.strip():
             print(result.stderr.strip(), file=sys.stderr)
@@ -222,6 +291,8 @@ def open_reserved_sessions(reservation: dict) -> bool:
         pending = {index for index in pending if read_state(root, index) != "waiting"}
         if pending:
             time.sleep(0.05)
+    if pending:
+        _atomic_write(_path(root, "cancel"), "cancel\n")
     return not pending
 
 
@@ -385,6 +456,32 @@ def cancel_main(argv: list[str]) -> int:
     return 0
 
 
+def wait_for_modifiers_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="spawn_agent_panes.py _wait-for-modifiers")
+    parser.add_argument(
+        "--timeout-seconds", type=float, default=MODIFIER_RELEASE_TIMEOUT_SECONDS
+    )
+    parser.add_argument(
+        "--stable-seconds", type=float, default=MODIFIER_RELEASE_STABLE_SECONDS
+    )
+    args = parser.parse_args(argv)
+    try:
+        released = wait_for_modifiers_released(
+            timeout_seconds=args.timeout_seconds,
+            stable_seconds=args.stable_seconds,
+        )
+    except OSError as exc:
+        print(f"spawn_agent_panes: couldn't read modifier state: {exc}", file=sys.stderr)
+        return 2
+    if not released:
+        print(
+            "spawn_agent_panes: modifier keys remained held; aborting Warp automation.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def legacy_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="spawn_agent_panes.py")
     parser.add_argument("--mode", choices=MODES, required=True)
@@ -411,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
         return fulfil_main(arguments[1:])
     if arguments and arguments[0] == "cancel":
         return cancel_main(arguments[1:])
+    if arguments and arguments[0] == "_wait-for-modifiers":
+        return wait_for_modifiers_main(arguments[1:])
     return legacy_main(arguments)
 
 

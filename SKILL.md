@@ -1,6 +1,6 @@
 ---
 name: pane
-description: This skill should be used when the user asks to branch the current conversation into a fresh agent session in a new Warp pane — e.g. "/pane work on 1 and 2", "let's do (1) and (3), new panes", "start that as a new pane", "spawn a pane to draft X", or "branch this into a new pane". It composes a handoff prompt per task and launches Claude or Codex in each new Warp split pane. The sibling `tab` and `window` skills are identical but open new Warp tabs or windows.
+description: Branch tasks from this conversation into fresh Claude or Codex sessions in new Warp split panes.
 ---
 
 # Spawn agent sessions in new Warp panes
@@ -57,7 +57,10 @@ atomically publishes each completed launch payload; the waiter claims and execut
    Record the reservation directory from the JSON printed on stdout. This command
    foregrounds Warp briefly, opens one destination per task, types a short waiter,
    returns focus after each opening, and succeeds only after every waiter reports
-   `waiting`. Do not continue to handoff composition if reservation fails.
+   `waiting`. Before every automated shortcut or typed command, it waits for physical
+   modifier keys to be released; it also rechecks that Warp is frontmost immediately
+   before typing. If focus changes, it aborts rather than redirecting input. Do not
+   continue to handoff composition if reservation fails.
 
 5. **Compose the prompt per task** — this is the part only the running agent can do
    well, because it has the conversation context the new session lacks:
@@ -144,6 +147,13 @@ Keep it focused — enough to act, not a transcript dump.
 
 - Reservation activates Warp, verifies it is frontmost, opens every destination from
   the currently active origin, and immediately returns focus after each opening.
+- Warp is activated once. The automation never tries to reclaim focus if you switch
+  away after that; it exits with an error instead.
+- If you switch apps or keep Command, Shift, Option, or Control held while reservation
+  is starting, the automation waits briefly and then aborts safely. Retry the reserve
+  command once Warp can remain frontmost and the modifier keys are released.
+- A failed reservation cancels any waiters that started before the interruption, so
+  partially opened destinations do not sit waiting for the full timeout.
 - Reserve before lengthy prompt composition. This narrows the remaining targeting
   race to the short interval between the user's request and the reserve command; later
   tab, window, or app changes cannot affect already-opened destinations.
